@@ -223,7 +223,7 @@ jobs:
           git config --global user.name "Numbersf"
           git config --global user.email "263623064@qq.com"
           mkdir kernel_workspace && cd kernel_workspace
-          git clone https://github.com/Numbersf/Action-Build.git -b ReSukiSU
+          git clone --no-checkout "https://github.com/${GITHUB_REPOSITORY}.git" Action-Build
           git -C Action-Build fetch --depth=1 origin "$GITHUB_SHA"
           git -C Action-Build checkout --detach "$GITHUB_SHA"
           test -f Action-Build/scripts/al1s_nomount.sh
