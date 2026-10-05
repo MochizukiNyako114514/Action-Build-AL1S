@@ -103,6 +103,21 @@ on:
         description: "管理器分支名(必填)/内置分支名(必填)/自定义版本标识(留空不修改)/回退分支提交哈希版本(留空不修改)//Manager Branch name (Required) / Builtin branch name (Required) / Custom version identifier (Leave blank to not modify) / Rollback branch commit hash version (Leave blank to not modify)"
         required: false
         default: "main/main/Numbersf/"
+      KSU_STATIC_SELINUX_REFERENCE:
+        type: boolean
+        description: "静态 SELinux 参考策略（高通8E专用）"
+        required: true
+        default: false
+      NOMOUNT:
+        type: boolean
+        description: "启用 NoMount 内核支持（独立于 OriginOS）//Enable NoMount kernel support"
+        required: true
+        default: true
+      ORIGINOS_DLKM:
+        type: boolean
+        description: "OriginOS兼容节点及显示适配，仅编入vendor_dlkm（不限制机型）；关闭为普通内核//OriginOS vendor_dlkm adapter (no device allow-list)"
+        required: true
+        default: false
       LZ4_UPDATE:
         type: boolean
         description: "是否升级LZ4到上游最新？//Upgrade LZ4 to the latest upstream?"
@@ -117,7 +132,7 @@ on:
         type: string
         description: "自定义内核后缀(不输入使用RAND_STR或-1关闭)//Custom kernel suffix (Leave blank to use RAND_STR, or -1 to disable)"
         required: false
-        default: ""
+        default: "Cyrene"
       RESUBLEVEL:
         description: "自定义内核等级欺骗(SUBLEVEL)//Custom kernel SUBLEVEL spoofing"
         required: false
@@ -209,6 +224,30 @@ jobs:
           git config --global user.email "263623064@qq.com"
           mkdir kernel_workspace && cd kernel_workspace
           git clone https://github.com/Numbersf/Action-Build.git -b ReSukiSU
+          git -C Action-Build fetch --depth=1 origin "$GITHUB_SHA"
+          git -C Action-Build checkout --detach "$GITHUB_SHA"
+          test -f Action-Build/scripts/al1s_nomount.sh
+          test -f Action-Build/scripts/al1s_patch_vendor_dlkm.py
+          test -f Action-Build/scripts/al1s_collect_dlkm.py
+          test -f Action-Build/patches/originos/al1s_originos.c
+
+      - name: Validate AL1S options
+        env:
+          ORIGINOS_DLKM: ${{ inputs.ORIGINOS_DLKM }}
+          FAST_BASE_RUN: ${{ inputs.FAST_BASE_RUN }}
+          FAST_BUILD: ${{ inputs.FAST_BUILD }}
+        run: |
+          if [[ -n "$FAST_BASE_RUN" ]]; then
+            if [[ ! "$FAST_BASE_RUN" =~ ^[0-9]+$ || "$FAST_BUILD" != "true" || "$ORIGINOS_DLKM" != "true" ]]; then
+              echo "::error::FAST_BASE_RUN requires a numeric run ID, FAST_BUILD and ORIGINOS_DLKM."
+              exit 1
+            fi
+            echo "Reusing saved FAST base from run $FAST_BASE_RUN; kernel options must match that build."
+          fi
+          echo "OriginOS DLKM=${ORIGINOS_DLKM}; no SELinux spoofing is included."
+          if [[ "$ORIGINOS_DLKM" == "true" ]]; then
+            echo "OriginOS display modules reuse Build Kernel FAST outputs when FAST_BUILD is enabled."
+          fi
 
       - name: Extract Manifest Info
         id: extract_info
@@ -339,6 +378,8 @@ jobs:
           echo "Selected KPM: ${{ github.event.inputs.KPM }}"
           echo "Custom SUSFS_META: ${{ github.event.inputs.SUSFS_META }}"
           echo "Custom KSU_META: ${{ github.event.inputs.KSU_META }}"
+          echo "KernelSU source: $KSU_REPOSITORY"
+          echo "Selected KSU_STATIC_SELINUX_REFERENCE: ${{ inputs.KSU_STATIC_SELINUX_REFERENCE }}"
           echo "Selected ZRAM: ${{ github.event.inputs.ZRAM }}"
           echo "Selected LSM_BBG: ${{ github.event.inputs.LSM_BBG }}"
           echo "Selected NETFILTER: ${{ github.event.inputs.NETFILTER }}"
@@ -1002,6 +1043,12 @@ jobs:
 
           # ReSukiSU配置
           set_config "CONFIG_KSU=y"
+          if [ "${{ inputs.KSU_STATIC_SELINUX_REFERENCE }}" = "true" ]; then
+            set_config "CONFIG_KSU_STATIC_SELINUX_REFERENCE=y"
+          else
+            set_config "CONFIG_KSU_STATIC_SELINUX_REFERENCE=n"
+          fi
+
           set_config "CONFIG_KSU_MULTI_MANAGER_SUPPORT=y"
           set_config "CONFIG_KSU_TOOLKIT_SUPPORT=y"
           if [[ -n "$KSU_CUSTOM_TAG" ]]; then
@@ -1139,6 +1186,17 @@ jobs:
             set_config "CONFIG_ANDROID_BINDER_IPC_RUST=m"
           fi
 
+      - name: Add NoMount support
+        if: ${{ inputs.NOMOUNT }}
+        run: bash "$GITHUB_WORKSPACE/kernel_workspace/Action-Build/scripts/al1s_nomount.sh" "$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/common"
+
+      - name: Add OriginOS compatibility to vendor msm_drm
+        if: ${{ inputs.ORIGINOS_DLKM }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/kernel_workspace/Action-Build/scripts/al1s_patch_vendor_dlkm.py" \
+            "$GITHUB_WORKSPACE/kernel_workspace" \
+            "$GITHUB_WORKSPACE/kernel_workspace/Action-Build/patches/originos/al1s_originos.c"
+
       # Custom kernel build time, without adding #1 SMP PREEMPT 自定义内核构建时间，不要加入#1 SMP PREEMPT
       - name: Custom BUILD_TIME
         if: ${{ github.event.inputs.BUILD_TIME != '-1' }}
@@ -1171,6 +1229,21 @@ jobs:
         run: |
           echo "Disabling GPUEB for MTK kernel 5.10"
           sed -i '/obj-y.*gpueb/d' kernel_workspace/kernel-5.10/drivers/gpu/mediatek/Makefile
+
+      - name: Preflight OriginOS module graph
+        if: ${{ inputs.ORIGINOS_DLKM && inputs.FAST_BUILD }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/kernel_workspace/Action-Build/scripts/al1s_preflight.py" "$GITHUB_WORKSPACE/kernel_workspace"
+
+      - name: Restore saved FAST kernel
+        if: ${{ inputs.FAST_BASE_RUN != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: AL1S-FAST-base-${{ inputs.FILE }}-*
+          merge-multiple: true
+          run-id: ${{ inputs.FAST_BASE_RUN }}
+          github-token: ${{ github.token }}
+          path: kernel_workspace/kernel_platform/common/out
 
       - name: Build Kernel FAST
         if: ${{ github.event.inputs.FAST_BUILD == 'true' }}
@@ -1375,17 +1448,61 @@ jobs:
           make -j"$(nproc --all)" O=out "${MAKE_ARGS[@]}"
           ccache -s
 
+      - name: Preserve completed FAST kernel
+        if: ${{ inputs.ORIGINOS_DLKM && inputs.FAST_BUILD && inputs.FAST_BASE_RUN == '' && steps.fast_build.outputs.fallback != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: AL1S-FAST-base-${{ inputs.FILE }}-${{ github.run_number }}
+          compression-level: 1
+          include-hidden-files: true
+          if-no-files-found: error
+          path: |
+            kernel_workspace/kernel_platform/common/out/vmlinux
+            kernel_workspace/kernel_platform/common/out/System.map
+            kernel_workspace/kernel_platform/common/out/Module.symvers
+            kernel_workspace/kernel_platform/common/out/vmlinux.symvers
+            kernel_workspace/kernel_platform/common/out/modules.*
+            kernel_workspace/kernel_platform/common/out/.config
+            kernel_workspace/kernel_platform/common/out/include/config/kernel.release
+            kernel_workspace/kernel_platform/common/out/arch/arm64/boot/Image
+            kernel_workspace/kernel_platform/common/out/**/*.ko
+
       - name: Fallback to Build Kernel
         if: ${{ github.event.inputs.FAST_BUILD == 'false' || steps.fast_build.outputs.fallback == 'true' }}
         run: |
           cd kernel_workspace
           if [ -f ./kernel_platform/build_with_bazel.py ]; then
             ./kernel_platform/oplus/bazel/oplus_modules_variant.sh ${{ env.CPUD }} ${{ env.BUILD_METHOD }}
+            if [[ "${{ inputs.ORIGINOS_DLKM }}" == "true" ]]; then
+              python3 "$GITHUB_WORKSPACE/kernel_workspace/Action-Build/scripts/al1s_build_kernel.py" \
+                "$GITHUB_WORKSPACE/kernel_workspace" "${{ env.CPUD }}" "${{ env.BUILD_METHOD }}" "false"
+            else
             ./kernel_platform/build_with_bazel.py -t ${{ env.CPUD }} ${{ env.BUILD_METHOD }}
+            fi
           else
             LTO=thin SYSTEM_DLKM_RE_SIGN=0 BUILD_SYSTEM_DLKM=0 KMI_SYMBOL_LIST_STRICT_MODE=0 \
             ./kernel_platform/oplus/build/oplus_build_kernel.sh ${{ env.CPUD }} ${{ env.BUILD_METHOD }}
           fi
+
+      - name: Build OriginOS external display DDK module
+        if: ${{ inputs.ORIGINOS_DLKM }}
+        run: |
+          bash "$GITHUB_WORKSPACE/kernel_workspace/Action-Build/scripts/al1s_build_display.sh" \
+            "$GITHUB_WORKSPACE/kernel_workspace" "${{ env.CPUD }}" "${{ env.BUILD_METHOD }}" "${{ inputs.FAST_BUILD && steps.fast_build.outputs.fallback != 'true' }}"
+
+      - name: Prepare OriginOS msm_drm module
+        if: ${{ inputs.ORIGINOS_DLKM }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/kernel_workspace/Action-Build/scripts/al1s_collect_dlkm.py" \
+            "$GITHUB_WORKSPACE/kernel_workspace" "$GITHUB_WORKSPACE/AL1S-vendor_dlkm"
+
+      - name: Upload OriginOS msm_drm module
+        if: ${{ inputs.ORIGINOS_DLKM }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: AL1S-OriginOS-msm_drm-${{ inputs.FILE }}-${{ github.run_number }}
+          path: AL1S-vendor_dlkm/msm_drm.ko
+          if-no-files-found: error
 
       - name: Make AnyKernel3
         run: |
